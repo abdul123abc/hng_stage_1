@@ -1,4 +1,4 @@
-````markdown
+```markdown
 # Automated Deployment Script
 
 A Bash script that automates the deployment of Dockerized applications to remote Linux servers.
