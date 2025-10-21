@@ -1,13 +1,6 @@
 #!/bin/bash
-# ============================================================
-# Automated Deployment Script (HNG DevOps Stage 1)
-# Author: Your Name
-# Description:
-#   Automates setup, deployment, and configuration of a Dockerized
-#   application on a remote Linux server.
-# ============================================================
 
-# === Global Config ===
+
 LOGFILE="deploy_$(date +%Y%m%d_%H%M%S).log"
 exec > >(tee -a "$LOGFILE") 2>&1
 set -e
@@ -15,7 +8,7 @@ trap 'echo "Error occurred on line $LINENO. Exiting..."; exit 1' ERR
 
 echo "Starting Automated Deployment..."
 
-# === 1. Collect User Input ===
+
 read -p "Enter Git Repository URL: " GIT_URL
 read -s -p "Enter Personal Access Token (PAT): " GIT_TOKEN
 echo
@@ -27,7 +20,7 @@ read -p "Remote Server IP: " SERVER_IP
 read -p "SSH Key Path: " SSH_KEY
 read -p "Application Port (internal container port): " APP_PORT
 
-# === Validate Inputs ===
+
 for var in GIT_URL GIT_TOKEN USERNAME SERVER_IP SSH_KEY APP_PORT; do
     if [ -z "${!var}" ]; then
         echo "Missing input: $var"
@@ -45,7 +38,7 @@ if ! [[ "$APP_PORT" =~ ^[0-9]+$ ]] || [ "$APP_PORT" -lt 1 ] || [ "$APP_PORT" -gt
     exit 1
 fi
 
-# === 2. Clone Repository ===
+
 echo "Cloning repository..."
 REPO_NAME=$(basename "$GIT_URL" .git)
 
@@ -72,7 +65,7 @@ else
 fi
 echo "Repository ready."
 
-# === 3. Validate Project Structure ===
+
 if [ -f "Dockerfile" ] || [ -f "docker-compose.yml" ]; then
     echo "Project validation successful."
 else
@@ -83,14 +76,14 @@ else
     exit 1
 fi
 
-# === 4. Test SSH Connection ===
+
 echo "Testing SSH connection..."
 ssh -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no "$USERNAME@$SERVER_IP" "echo 'SSH connection successful'" || {
     echo "SSH connection failed. Check IP, username, or key."
     exit 1
 }
 
-# === 5. Prepare Remote Environment ===
+
 echo "Preparing remote environment..."
 ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$USERNAME@$SERVER_IP" << 'EOF'
 set -e
@@ -129,7 +122,7 @@ echo "Remote environment setup completed"
 EOF
 echo "Remote environment ready."
 
-# === 6. Transfer Files and Deploy ===
+
 echo "Transferring project files..."
 ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$USERNAME@$SERVER_IP" "rm -rf ~/app && mkdir -p ~/app"
 scp -i "$SSH_KEY" -o StrictHostKeyChecking=no -r . "$USERNAME@$SERVER_IP:~/app"
@@ -146,6 +139,7 @@ if [ -f "docker-compose.yml" ]; then
     echo "Using docker-compose..."
     sudo docker-compose down || true
     sudo docker-compose up -d --build
+    CONTAINER_NAME="\$(sudo docker-compose ps -q | head -1)"
 else
     echo "Using Dockerfile..."
     IMAGE_NAME="app-\$(basename \$(pwd))"
@@ -153,6 +147,7 @@ else
     sudo docker rm \$IMAGE_NAME 2>/dev/null || true
     sudo docker build -t \$IMAGE_NAME .
     sudo docker run -d -p $APP_PORT:$APP_PORT --name \$IMAGE_NAME \$IMAGE_NAME
+    CONTAINER_NAME="\$IMAGE_NAME"
 fi
 
 # Wait for containers to start
@@ -165,10 +160,13 @@ sudo docker ps
 # Test application internally
 echo "Testing application internally..."
 curl -f http://localhost:$APP_PORT || curl -I http://localhost:$APP_PORT || echo "Application may still be starting"
+
+# Save container name for cleanup
+echo \$CONTAINER_NAME > ~/container_name.txt
 EOF
 echo "Application deployed successfully."
 
-# === 7. Configure Nginx Reverse Proxy ===
+
 echo "Configuring Nginx reverse proxy..."
 ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$USERNAME@$SERVER_IP" << EOF
 sudo bash -c 'cat > /etc/nginx/sites-available/app.conf << NGINX
@@ -199,7 +197,7 @@ sudo nginx -t && sudo systemctl reload nginx
 EOF
 echo "Nginx configuration completed."
 
-# === 8. Validate Deployment ===
+
 echo "Validating deployment..."
 ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$USERNAME@$SERVER_IP" << EOF
 echo "=== Service Status ==="
@@ -225,26 +223,77 @@ else
     echo "Public access test: Application may still be starting or firewall blocked"
 fi
 
-# === 9. Optional Cleanup ===
-if [[ "$1" == "--cleanup" ]]; then
-    echo "Cleaning up remote environment..."
-    ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$USERNAME@$SERVER_IP" << EOF
+
+cleanup_deployment() {
+    echo "Starting cleanup process..."
+    
+
+    if [[ -z "$USERNAME" || -z "$SERVER_IP" || -z "$SSH_KEY" ]]; then
+        echo "Cleanup requires server details..."
+        read -p "Remote Server Username: " USERNAME
+        read -p "Remote Server IP: " SERVER_IP
+        read -p "SSH Key Path: " SSH_KEY
+    fi
+    
+    if [[ -z "$REPO_NAME" ]]; then
+        read -p "Enter project/repository name: " REPO_NAME
+    fi
+    
+    echo "Cleaning up deployment on $SERVER_IP..."
+    
+    ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$USERNAME@$SERVER_IP" << 'CLEANUP_EOF'
 set -e
-cd ~/app 2>/dev/null && sudo docker-compose down || true
-sudo docker stop app-$REPO_NAME 2>/dev/null || true
-sudo docker rm app-$REPO_NAME 2>/dev/null || true
-sudo docker rmi app-$REPO_NAME 2>/dev/null || true
-sudo rm -rf ~/app /etc/nginx/sites-available/app.conf /etc/nginx/sites-enabled/app.conf
-sudo systemctl reload nginx
-echo "Cleanup completed on remote server"
-EOF
-    echo "Cleanup completed."
+echo "Stopping and removing containers..."
+
+# Stop and remove all app containers
+sudo docker ps -a --filter "name=app-" --format "{{.Names}}" | while read container; do
+    echo "Stopping container: \$container"
+    sudo docker stop "\$container" 2>/dev/null || true
+    sudo docker rm "\$container" 2>/dev/null || true
+done
+
+# Stop and remove containers from docker-compose
+if [ -f "~/app/docker-compose.yml" ]; then
+    cd ~/app
+    sudo docker-compose down 2>/dev/null || true
+fi
+
+# Remove all app images
+sudo docker images --filter "reference=app-*" --format "{{.ID}}" | while read image; do
+    echo "Removing image: \$image"
+    sudo docker rmi "\$image" 2>/dev/null || true
+done
+
+# Clean up any dangling containers and images
+sudo docker system prune -af 2>/dev/null || true
+
+# Remove Nginx configuration
+echo "Removing Nginx configuration..."
+sudo rm -f /etc/nginx/sites-available/app.conf
+sudo rm -f /etc/nginx/sites-enabled/app.conf
+sudo systemctl reload nginx 2>/dev/null || true
+
+# Remove application files
+echo "Removing application files..."
+sudo rm -rf ~/app
+sudo rm -f ~/container_name.txt
+
+echo "Cleanup completed successfully"
+CLEANUP_EOF
+
+    echo "Cleanup finished on $SERVER_IP"
+}
+
+
+if [[ "$1" == "--cleanup" ]]; then
+    cleanup_deployment
     exit 0
 fi
 
-# === 10. Completion ===
+
 echo "=========================================="
 echo "Deployment completed successfully!"
 echo "Application URL: http://$SERVER_IP"
 echo "Logs saved to: $LOGFILE"
+echo "Cleanup command: ./deploy.sh --cleanup"
 echo "=========================================="
